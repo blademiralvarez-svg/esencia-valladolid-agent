@@ -45,6 +45,21 @@ logger.setLevel(logging.DEBUG if ENVIRONMENT == "development" else logging.INFO)
 
 PORT = int(os.getenv("PORT", "8000"))
 
+# Numeros del equipo que a veces escriben directo (1 a 1) al numero del hotel para
+# temas internos. Se comparan por los ultimos 10 digitos para no depender de si
+# WhatsApp antepone el "1" de larga distancia movil de Mexico (+52 1 XXX...) o no.
+NUMEROS_EQUIPO = {
+    n.strip()[-10:] for n in (os.getenv("NUMEROS_EQUIPO") or "").split(",") if n.strip()
+}
+
+
+def _es_numero_equipo(telefono: str) -> bool:
+    """True si el mensaje viene de un numero del equipo, no de un huesped."""
+    if not NUMEROS_EQUIPO:
+        return False
+    digitos = "".join(c for c in telefono if c.isdigit())
+    return digitos[-10:] in NUMEROS_EQUIPO
+
 # Un candado por numero de telefono. En WhatsApp es normal que alguien mande "hola" y
 # medio segundo despues la pregunta de verdad: sin esto los dos mensajes se procesarian
 # en paralelo, los dos leerian el mismo historial y las escrituras quedarian intercaladas.
@@ -149,6 +164,10 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
     encolados = 0
     for msg in mensajes:
         if msg.es_propio or not msg.texto.strip():
+            continue
+
+        if _es_numero_equipo(msg.telefono):
+            logger.info(f"Mensaje de un numero del equipo ({msg.telefono}), se ignora")
             continue
 
         # La entrega es "al menos una vez": el mismo evento puede llegar dos veces
