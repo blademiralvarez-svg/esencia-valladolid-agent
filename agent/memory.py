@@ -187,7 +187,16 @@ async def limpiar_historial(telefono: str):
 
 
 async def pausar_conversacion(conversation_id: str, horas: float):
-    """Pausa a Ana en esta conversacion: un humano de recepcion tomo el control."""
+    """
+    Pausa a Ana en esta conversacion: un humano de recepcion tomo el control.
+
+    Es un patron "leer, despues insertar o actualizar" -- si dos eventos de la MISMA
+    conversacion llegaran casi al mismo tiempo (dos mensajes seguidos de recepcion),
+    los dos podrian no encontrar fila existente e intentar el INSERT, y el segundo
+    commit fallaria con IntegrityError. Se maneja igual que marcar_evento_procesado:
+    si el INSERT choca, es porque el otro ya gano la carrera, y alcanza con
+    actualizar esa fila en vez de propagar el error.
+    """
     if not conversation_id:
         return
     hasta = ahora() + timedelta(hours=horas)
@@ -195,9 +204,19 @@ async def pausar_conversacion(conversation_id: str, horas: float):
         existente = await session.get(ConversacionPausada, conversation_id)
         if existente:
             existente.pausado_hasta = hasta
-        else:
-            session.add(ConversacionPausada(conversation_id=conversation_id, pausado_hasta=hasta))
-        await session.commit()
+            await session.commit()
+            return
+
+        session.add(ConversacionPausada(conversation_id=conversation_id, pausado_hasta=hasta))
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            async with async_session() as session2:
+                existente = await session2.get(ConversacionPausada, conversation_id)
+                if existente:
+                    existente.pausado_hasta = hasta
+                    await session2.commit()
 
 
 async def esta_pausada(conversation_id: str) -> bool:

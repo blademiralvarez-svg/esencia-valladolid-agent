@@ -158,10 +158,17 @@ class ProveedorZernio(ProveedorWhatsApp):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        # Si el webhook se reintenta, esta clave evita que Zernio mande la respuesta dos veces
+        # Si el webhook se reintenta, esta clave evita que Zernio mande la respuesta dos
+        # veces. OJO: tiene que incluir el TEXTO del mensaje, no solo el evento_id.
+        # Un mismo evento_id puede terminar mandando dos mensajes distintos (la
+        # respuesta real, y despues el mensaje de error si algo fallo mas adelante en
+        # ese mismo procesamiento) -- si compartieran la misma key, Zernio deduplicaria
+        # el segundo envio como si fuera un reintento del primero, devolviendo 200 sin
+        # entregarlo, y este codigo (que solo mira el status_code) lo daria por enviado.
         evento_id = contexto.get("evento_id")
         if evento_id:
-            headers["Idempotency-Key"] = f"agentkit-{evento_id}"
+            hash_mensaje = hashlib.sha256(mensaje.encode("utf-8")).hexdigest()[:12]
+            headers["Idempotency-Key"] = f"agentkit-{evento_id}-{hash_mensaje}"
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as cliente:
@@ -200,6 +207,18 @@ class ProveedorZernio(ProveedorWhatsApp):
         """
         if not self.api_key:
             return False, "Falta ZERNIO_API_KEY"
+
+        # verificar_firma "falla abierto" (acepta cualquier webhook sin firmar) si
+        # falta el secret -- ya se advierte al arrancar con logger.warning, pero eso
+        # no se ve en ningun lado despues. En produccion, que el webhook quede
+        # totalmente abierto tiene que reflejarse en el health check, no quedar
+        # escondido en un log que nadie vuelve a mirar.
+        if not self.webhook_secret and os.getenv("ENVIRONMENT") == "production":
+            return False, (
+                "ZERNIO_WEBHOOK_SECRET no configurado en produccion: el webhook "
+                "acepta cualquier request sin verificar la firma"
+            )
+
         if not self.account_id:
             return True, "ZERNIO_ACCOUNT_ID no configurado: se omite el chequeo del numero"
 

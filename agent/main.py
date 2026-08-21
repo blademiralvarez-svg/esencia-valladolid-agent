@@ -65,11 +65,22 @@ MARGEN_ECO_SEGUNDOS = 20
 # conversation_id -> hora (UTC) del ultimo mensaje que Ana misma mando ahi
 _ultimo_envio_ana: dict[str, datetime] = {}
 
+def _solo_digitos(numero: str) -> str:
+    return "".join(c for c in numero if c.isdigit())
+
+
 # Numeros del equipo que a veces escriben directo (1 a 1) al numero del hotel para
 # temas internos. Se comparan por los ultimos 10 digitos para no depender de si
 # WhatsApp antepone el "1" de larga distancia movil de Mexico (+52 1 XXX...) o no.
+# Ojo: hay que normalizar los DOS lados igual (extraer solo digitos antes de
+# recortar) -- si esta lista se arma con un simple [-10:] sobre el string crudo del
+# .env y alguien carga un numero con formato ("985-104-5092", "+52 985..."), el
+# filtro se rompe en silencio porque deja de coincidir con los digitos limpios que
+# usa _es_numero_equipo().
 NUMEROS_EQUIPO = {
-    n.strip()[-10:] for n in (os.getenv("NUMEROS_EQUIPO") or "").split(",") if n.strip()
+    _solo_digitos(n)[-10:]
+    for n in (os.getenv("NUMEROS_EQUIPO") or "").split(",")
+    if n.strip()
 }
 
 
@@ -77,8 +88,7 @@ def _es_numero_equipo(telefono: str) -> bool:
     """True si el mensaje viene de un numero del equipo, no de un huesped."""
     if not NUMEROS_EQUIPO:
         return False
-    digitos = "".join(c for c in telefono if c.isdigit())
-    return digitos[-10:] in NUMEROS_EQUIPO
+    return _solo_digitos(telefono)[-10:] in NUMEROS_EQUIPO
 
 # Un candado por numero de telefono. En WhatsApp es normal que alguien mande "hola" y
 # medio segundo despues la pregunta de verdad: sin esto los dos mensajes se procesarian
@@ -174,7 +184,14 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
     if not await proveedor.verificar_firma(request):
         raise HTTPException(status_code=401, detail="Firma del webhook invalida")
 
-    conversation_id_pausar = await proveedor.detectar_pausa_humana(request)
+    try:
+        conversation_id_pausar = await proveedor.detectar_pausa_humana(request)
+    except Exception as e:  # noqa: BLE001
+        # Un payload raro (no-JSON, vacio, un array en vez de un objeto) no debe
+        # escapar como 500: eso le confirmaria a Zernio que reintente el evento.
+        logger.error(f"No se pudo leer el webhook (deteccion de pausa humana): {e}")
+        return {"status": "ignorado"}
+
     if conversation_id_pausar:
         ultimo_envio = _ultimo_envio_ana.get(conversation_id_pausar)
         segundos_desde_envio = (
@@ -204,7 +221,24 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
 
     encolados = 0
     for msg in mensajes:
-        if msg.es_propio or not msg.texto.strip():
+        if msg.es_propio:
+            continue
+
+        if not msg.telefono:
+            # Sin telefono, businessScopedUserId NI id no hay forma de saber quien
+            # escribio. Nunca tratar esto como una conversacion mas: memory.py indexa
+            # todo el historial por telefono, y dos huespedes sin identificador
+            # terminarian compartiendo la MISMA clave (""), viendo el historial y el
+            # candado el uno del otro.
+            logger.error(f"Mensaje sin telefono identificable, se descarta: {msg.contexto}")
+            continue
+
+        if not msg.texto.strip():
+            # Notas de voz, imagenes, ubicaciones, stickers: parsear_webhook los deja
+            # con texto="". Se loguea (a diferencia de antes) para poder ver en los
+            # logs que el huesped mando algo y Ana no lo pudo procesar, en vez de que
+            # parezca que el mensaje nunca llego.
+            logger.info(f"Mensaje sin texto de {msg.telefono} (adjunto no soportado aun), se ignora")
             continue
 
         if _es_numero_equipo(msg.telefono):
@@ -213,7 +247,11 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
 
         conversation_id = msg.contexto.get("conversation_id")
         if await esta_pausada(conversation_id):
+            # Se guarda igual en el historial (aunque Ana no conteste ahora): si no,
+            # cuando la pausa venza Ana retoma sin ningun rastro de lo que el huesped
+            # dijo mientras recepcion lo atendia.
             logger.info(f"Conversacion {conversation_id} pausada (recepcion la esta atendiendo), se ignora")
+            await guardar_mensaje(msg.telefono, "user", msg.texto)
             continue
 
         # La entrega es "al menos una vez": el mismo evento puede llegar dos veces
@@ -227,6 +265,31 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
         encolados += 1
 
     return {"status": "ok", "encolados": encolados}
+
+
+# Reintentos de ENVIO (no del webhook): webhook_handler ya le devolvio 200 a Zernio
+# antes de que este BackgroundTask corra, asi que desde la perspectiva de Zernio el
+# evento ya se entrego con exito -- no hay ningun reintento del lado del proveedor
+# que pueda salvar un envio fallido. Si Ana no reintenta ella misma aca, un fallo de
+# red pasajero hablando con Zernio deja al huesped sin respuesta para siempre.
+REINTENTOS_ENVIO = 3
+ESPERA_ENTRE_REINTENTOS_SEGUNDOS = 2.0
+
+
+async def _enviar_con_reintentos(telefono: str, mensaje: str, contexto: dict) -> bool:
+    for intento in range(1, REINTENTOS_ENVIO + 1):
+        if await proveedor.enviar_mensaje(telefono, mensaje, contexto):
+            return True
+        if intento < REINTENTOS_ENVIO:
+            logger.warning(f"Reintentando envio a {telefono} (intento {intento + 1}/{REINTENTOS_ENVIO})")
+            await asyncio.sleep(ESPERA_ENTRE_REINTENTOS_SEGUNDOS)
+    return False
+
+
+def _registrar_envio_ana(contexto: dict):
+    conversation_id = contexto.get("conversation_id")
+    if conversation_id:
+        _ultimo_envio_ana[conversation_id] = datetime.now(timezone.utc)
 
 
 async def procesar_mensaje(msg: MensajeEntrante):
@@ -245,18 +308,17 @@ async def procesar_mensaje(msg: MensajeEntrante):
             historial = await obtener_historial(msg.telefono)
             respuesta, es_respuesta_real = await generar_respuesta(msg.texto, historial)
 
-            enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta, msg.contexto)
+            enviado = await _enviar_con_reintentos(msg.telefono, respuesta, msg.contexto)
 
-            conversation_id = msg.contexto.get("conversation_id")
-            if enviado and conversation_id:
-                _ultimo_envio_ana[conversation_id] = datetime.now(timezone.utc)
-
-            if not enviado:
-                # El evento se marco como procesado ANTES de llegar hasta aca, para que dos
-                # entregas simultaneas no se dupliquen. Si el envio fallo, hay que soltarlo:
-                # si no, el reintento del proveedor se descartaria por duplicado y el cliente
-                # se quedaria sin respuesta para siempre.
-                logger.error(f"No se pudo enviar la respuesta a {msg.telefono}; se libera el evento")
+            if enviado:
+                _registrar_envio_ana(msg.contexto)
+            else:
+                # Ya se reintento varias veces: esto es una falla real de red/Zernio,
+                # no algo que un reintento futuro del proveedor vaya a resolver (el
+                # webhook original ya se respondio 200). Se libera el evento igual,
+                # por si el huesped reenvia el mismo mensaje mas tarde y Zernio lo
+                # entrega con el mismo evento_id -- eso si tiene que procesarse.
+                logger.error(f"No se pudo enviar la respuesta a {msg.telefono} tras reintentos; se libera el evento")
                 await liberar_evento(evento_id)
                 return
 
@@ -273,6 +335,7 @@ async def procesar_mensaje(msg: MensajeEntrante):
             logger.exception(f"Error procesando el mensaje de {msg.telefono}: {e}")
             await liberar_evento(evento_id)
             try:
-                await proveedor.enviar_mensaje(msg.telefono, obtener_mensaje_error(), msg.contexto)
+                if await _enviar_con_reintentos(msg.telefono, obtener_mensaje_error(), msg.contexto):
+                    _registrar_envio_ana(msg.contexto)
             except Exception:  # noqa: BLE001
                 logger.error("Tampoco se pudo avisarle al cliente del error")

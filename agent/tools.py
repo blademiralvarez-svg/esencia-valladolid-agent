@@ -78,14 +78,14 @@ def obtener_tipos_habitacion() -> list[dict]:
     return [
         {
             "tipo": "alberca_privada",
-            "nombre": "Habitacion con Alberca Privada",
+            "nombre": "Habitación con Alberca Privada",
             "ubicacion": "Planta baja",
             "cama": "King",
             "unidades": 4,
         },
         {
             "tipo": "boutique",
-            "nombre": "Habitacion Boutique",
+            "nombre": "Habitación Boutique",
             "ubicacion": "Segundo piso",
             "cama": "Matrimonial",
             "unidades": 4,

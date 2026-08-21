@@ -33,6 +33,26 @@ client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 # pasadas). Yucatan no tiene horario de verano, asi que la zona es fija todo el anio.
 ZONA_HORARIA_HOTEL = ZoneInfo("America/Merida")
 
+# Las dos herramientas de Cloudbeds toman exactamente los mismos parametros (fechas
+# y huespedes): un solo schema compartido, en vez de mantener dos copias que se
+# puedan desincronizar si mas adelante cambia uno y no el otro.
+_SCHEMA_FECHAS_HUESPEDES = {
+    "type": "object",
+    "properties": {
+        "fecha_entrada": {
+            "type": "string",
+            "description": "Fecha de check-in, formato YYYY-MM-DD",
+        },
+        "fecha_salida": {
+            "type": "string",
+            "description": "Fecha de check-out, formato YYYY-MM-DD",
+        },
+        "adultos": {"type": "integer", "description": "Numero de adultos"},
+        "ninos": {"type": "integer", "description": "Numero de ninos (0 si no hay)"},
+    },
+    "required": ["fecha_entrada", "fecha_salida", "adultos"],
+}
+
 TOOLS = [
     {
         "name": "consultar_disponibilidad_cloudbeds",
@@ -42,22 +62,7 @@ TOOLS = [
             "el huesped pregunte por disponibilidad o precio de una habitacion con fechas "
             "concretas, en vez de decir que no tenes esa informacion."
         ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "fecha_entrada": {
-                    "type": "string",
-                    "description": "Fecha de check-in, formato YYYY-MM-DD",
-                },
-                "fecha_salida": {
-                    "type": "string",
-                    "description": "Fecha de check-out, formato YYYY-MM-DD",
-                },
-                "adultos": {"type": "integer", "description": "Numero de adultos"},
-                "ninos": {"type": "integer", "description": "Numero de ninos (0 si no hay)"},
-            },
-            "required": ["fecha_entrada", "fecha_salida", "adultos"],
-        },
+        "input_schema": _SCHEMA_FECHAS_HUESPEDES,
     },
     {
         "name": "generar_link_reserva_cloudbeds",
@@ -66,22 +71,7 @@ TOOLS = [
             "ya cargados, para que el huesped complete la reserva y el pago el mismo. "
             "Usala despues de confirmar disponibilidad, cuando el huesped quiera reservar."
         ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "fecha_entrada": {
-                    "type": "string",
-                    "description": "Fecha de check-in, formato YYYY-MM-DD",
-                },
-                "fecha_salida": {
-                    "type": "string",
-                    "description": "Fecha de check-out, formato YYYY-MM-DD",
-                },
-                "adultos": {"type": "integer", "description": "Numero de adultos"},
-                "ninos": {"type": "integer", "description": "Numero de ninos (0 si no hay)"},
-            },
-            "required": ["fecha_entrada", "fecha_salida", "adultos"],
-        },
+        "input_schema": _SCHEMA_FECHAS_HUESPEDES,
     },
 ]
 
@@ -109,6 +99,10 @@ async def _ejecutar_herramienta(nombre: str, entrada: dict) -> str:
                 adultos=int(entrada.get("adultos") or 1),
                 ninos=int(entrada.get("ninos") or 0),
             )
+            if link is None:
+                return json.dumps(
+                    {"error": "No se pudo generar el link de reserva"}, ensure_ascii=False
+                )
             return json.dumps({"link": link}, ensure_ascii=False)
 
         return json.dumps({"error": f"Herramienta desconocida: {nombre}"}, ensure_ascii=False)
@@ -250,7 +244,12 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
     """
     global _soporta_esfuerzo
 
-    if not mensaje or len(mensaje.strip()) < 2:
+    # Ojo: NO se puede exigir un largo minimo aca. Un huesped respondiendo a "para
+    # cuantos adultos?" con "2" es un mensaje de 1 caracter perfectamente valido; con
+    # un guard de "< 2 caracteres" ese "2" caia en el fallback ("no entendi tu
+    # mensaje") en vez de procesarse. "not mensaje" ya cubre los casos realmente
+    # vacios (None o "").
+    if not mensaje or not mensaje.strip():
         return obtener_mensaje_fallback(), False
 
     mensajes = [{"role": m["role"], "content": m["content"]} for m in historial]
@@ -308,6 +307,15 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
         except Exception as e:  # noqa: BLE001
             logger.error(f"Error llamando a Claude durante el uso de herramientas: {e}")
             return obtener_mensaje_error(), False
+
+    if respuesta.stop_reason == "tool_use":
+        # Se agoto MAX_ITERACIONES_HERRAMIENTAS sin que el modelo terminara de usar
+        # herramientas. _extraer_texto igual sigue de largo (puede devolver texto
+        # parcial o vacio), pero sin este log no queda ningun rastro de que paso.
+        logger.warning(
+            f"Se agotaron las {MAX_ITERACIONES_HERRAMIENTAS} iteraciones de herramientas "
+            "sin que el modelo terminara; la respuesta puede venir incompleta."
+        )
 
     if getattr(respuesta, "stop_reason", None) == "max_tokens":
         logger.warning(
