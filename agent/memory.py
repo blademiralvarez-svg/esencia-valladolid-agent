@@ -78,6 +78,21 @@ class EventoProcesado(Base):
     creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora, index=True)
 
 
+class ConversacionPausada(Base):
+    """
+    Conversaciones donde un humano de recepcion tomo el control.
+
+    Cuando alguien responde manualmente desde la app de WhatsApp Business (numero en
+    modo Coexistence), Ana deja de contestar en esa conversacion por un rato, para no
+    pisarle la respuesta a la persona que ya esta atendiendo.
+    """
+
+    __tablename__ = "conversaciones_pausadas"
+
+    conversation_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    pausado_hasta: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 async def inicializar_db():
     """Crea las tablas si no existen."""
     async with engine.begin() as conn:
@@ -169,3 +184,34 @@ async def limpiar_historial(telefono: str):
     async with async_session() as session:
         await session.execute(delete(Mensaje).where(Mensaje.telefono == telefono))
         await session.commit()
+
+
+async def pausar_conversacion(conversation_id: str, horas: float):
+    """Pausa a Ana en esta conversacion: un humano de recepcion tomo el control."""
+    if not conversation_id:
+        return
+    hasta = ahora() + timedelta(hours=horas)
+    async with async_session() as session:
+        existente = await session.get(ConversacionPausada, conversation_id)
+        if existente:
+            existente.pausado_hasta = hasta
+        else:
+            session.add(ConversacionPausada(conversation_id=conversation_id, pausado_hasta=hasta))
+        await session.commit()
+
+
+async def esta_pausada(conversation_id: str) -> bool:
+    """True si un humano tomo el control de esta conversacion y todavia no vence la pausa."""
+    if not conversation_id:
+        return False
+    async with async_session() as session:
+        registro = await session.get(ConversacionPausada, conversation_id)
+        if not registro:
+            return False
+        # SQLite no guarda la zona horaria: al leerlo vuelve "naive". Se asume UTC
+        # (es lo que escribe "ahora()") para poder comparar. PostgreSQL en produccion
+        # no tiene este problema, pero normalizar aca no le hace nada de mal.
+        pausado_hasta = registro.pausado_hasta
+        if pausado_hasta.tzinfo is None:
+            pausado_hasta = pausado_hasta.replace(tzinfo=timezone.utc)
+        return pausado_hasta > ahora()

@@ -78,6 +78,23 @@ class ProveedorZernio(ProveedorWhatsApp):
             return False
         return True
 
+    async def detectar_pausa_humana(self, request: Request) -> str | None:
+        """
+        Si alguien de recepcion contesto desde la app nativa de WhatsApp Business
+        (numero en modo Coexistence), Zernio manda ese envio como message.sent con
+        source="whatsapp_business_app" en vez de "cloud_api". Eso es la senal de que
+        un humano tomo la conversacion y Ana deberia quedarse callada un rato.
+        """
+        payload = await request.json()
+        if payload.get("event") != "message.sent":
+            return None
+
+        mensaje = payload.get("message") or {}
+        if mensaje.get("platform") != "whatsapp" or mensaje.get("source") != "whatsapp_business_app":
+            return None
+
+        return mensaje.get("conversationId") or None
+
     async def parsear_webhook(self, request: Request) -> list[MensajeEntrante]:
         """Normaliza el evento message.received de Zernio."""
         payload = await request.json()

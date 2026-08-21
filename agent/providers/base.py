@@ -56,3 +56,14 @@ class ProveedorWhatsApp(ABC):
     async def verificar_conexion(self) -> tuple[bool, str]:
         """Chequea que las credenciales sirvan. Retorna (ok, mensaje_legible)."""
         return True, "Este proveedor no expone un chequeo de conexion"
+
+    async def detectar_pausa_humana(self, request: Request) -> str | None:
+        """
+        Si este evento es un humano respondiendo manualmente (fuera del agente),
+        retorna el conversation_id a pausar. None si no aplica.
+
+        Solo tiene sentido en setups donde un humano y el agente comparten el mismo
+        numero (ej. WhatsApp Business App + Cloud API en modo Coexistence). Por
+        defecto no aplica a ningun proveedor.
+        """
+        return None

@@ -18,12 +18,14 @@ from fastapi.responses import PlainTextResponse
 
 from agent.brain import generar_respuesta, obtener_mensaje_error
 from agent.memory import (
+    esta_pausada,
     guardar_mensaje,
     inicializar_db,
     liberar_evento,
     limpiar_eventos_viejos,
     marcar_evento_procesado,
     obtener_historial,
+    pausar_conversacion,
 )
 from agent.providers import obtener_proveedor
 from agent.providers.base import MensajeEntrante
@@ -44,6 +46,11 @@ logger = logging.getLogger("agentkit")
 logger.setLevel(logging.DEBUG if ENVIRONMENT == "development" else logging.INFO)
 
 PORT = int(os.getenv("PORT", "8000"))
+
+# Cuando alguien de recepcion contesta manual desde la app de WhatsApp Business
+# (numero en modo Coexistence), Ana se queda callada en esa conversacion por este
+# tiempo, para no pisarle la respuesta a quien ya esta atendiendo al huesped.
+PAUSA_HUMANO_HORAS = float(os.getenv("PAUSA_HUMANO_HORAS") or "2")
 
 # Numeros del equipo que a veces escriben directo (1 a 1) al numero del hotel para
 # temas internos. Se comparan por los ultimos 10 digitos para no depender de si
@@ -154,6 +161,15 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
     if not await proveedor.verificar_firma(request):
         raise HTTPException(status_code=401, detail="Firma del webhook invalida")
 
+    conversation_id_pausar = await proveedor.detectar_pausa_humana(request)
+    if conversation_id_pausar:
+        await pausar_conversacion(conversation_id_pausar, PAUSA_HUMANO_HORAS)
+        logger.info(
+            f"Recepcion tomo la conversacion {conversation_id_pausar}; "
+            f"Ana se pausa ahi por {PAUSA_HUMANO_HORAS}h"
+        )
+        return {"status": "ok", "pausado": True}
+
     try:
         mensajes = await proveedor.parsear_webhook(request)
     except Exception as e:  # noqa: BLE001
@@ -168,6 +184,11 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
 
         if _es_numero_equipo(msg.telefono):
             logger.info(f"Mensaje de un numero del equipo ({msg.telefono}), se ignora")
+            continue
+
+        conversation_id = msg.contexto.get("conversation_id")
+        if await esta_pausada(conversation_id):
+            logger.info(f"Conversacion {conversation_id} pausada (recepcion la esta atendiendo), se ignora")
             continue
 
         # La entrega es "al menos una vez": el mismo evento puede llegar dos veces
