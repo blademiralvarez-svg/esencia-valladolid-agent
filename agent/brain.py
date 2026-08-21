@@ -155,7 +155,7 @@ MESES_ES = [
 ]
 
 
-def cargar_system_prompt() -> str:
+def cargar_system_prompt(es_primer_mensaje: bool = False) -> str:
     """
     El system prompt: quien es el agente, que sabe del negocio, y que fecha es hoy.
 
@@ -176,7 +176,19 @@ def cargar_system_prompt() -> str:
         f"\"el 10 de septiembre\") antes de llamar a cualquier herramienta. Las fechas "
         f"que le pases a las herramientas van en formato YYYY-MM-DD."
     )
-    return base + contexto_fecha
+
+    if not es_primer_mensaje:
+        return base + contexto_fecha
+
+    contexto_primer_mensaje = (
+        f"\n\n## Este es el primer mensaje de la conversacion\n"
+        f"Antes de responder lo que te haya preguntado, aclara brevemente y de forma "
+        f"natural (no como un aviso legal ni una lista) que eres una asistente virtual "
+        f"con inteligencia artificial, y que puedes hablar en el idioma que el huesped "
+        f"prefiera. Hazlo en una frase corta, en el mismo idioma en el que te escribio, "
+        f"y sigue con la respuesta a lo que haya preguntado en el mismo mensaje."
+    )
+    return base + contexto_fecha + contexto_primer_mensaje
 
 
 def obtener_mensaje_error() -> str:
@@ -244,7 +256,7 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
     mensajes = [{"role": m["role"], "content": m["content"]} for m in historial]
     mensajes.append({"role": "user", "content": mensaje})
 
-    system_prompt = cargar_system_prompt()
+    system_prompt = cargar_system_prompt(es_primer_mensaje=not historial)
     extras = {"output_config": {"effort": ESFUERZO}} if (_soporta_esfuerzo and ESFUERZO) else {}
 
     async def _llamar(parametros_extra: dict):
