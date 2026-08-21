@@ -11,6 +11,7 @@ import logging
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -51,6 +52,18 @@ PORT = int(os.getenv("PORT", "8000"))
 # (numero en modo Coexistence), Ana se queda callada en esa conversacion por este
 # tiempo, para no pisarle la respuesta a quien ya esta atendiendo al huesped.
 PAUSA_HUMANO_HORAS = float(os.getenv("PAUSA_HUMANO_HORAS") or "2")
+
+# En modo Coexistence, WhatsApp sincroniza el propio mensaje de Ana hacia la app
+# nativa de WhatsApp Business, y Zernio manda ESE eco como si fuera un message.sent
+# con source="whatsapp_business_app" -- indistinguible de un humano contestando de
+# verdad. Confirmado en produccion: Ana se pausaba sola segundos despues de cada
+# respuesta propia. Si la senal de "un humano tomo la conversacion" llega dentro de
+# este margen desde que Ana misma le mando un mensaje a esa conversacion, se descarta
+# por ser casi seguro el eco, no una persona.
+MARGEN_ECO_SEGUNDOS = 20
+
+# conversation_id -> hora (UTC) del ultimo mensaje que Ana misma mando ahi
+_ultimo_envio_ana: dict[str, datetime] = {}
 
 # Numeros del equipo que a veces escriben directo (1 a 1) al numero del hotel para
 # temas internos. Se comparan por los ultimos 10 digitos para no depender de si
@@ -163,11 +176,23 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
 
     conversation_id_pausar = await proveedor.detectar_pausa_humana(request)
     if conversation_id_pausar:
-        await pausar_conversacion(conversation_id_pausar, PAUSA_HUMANO_HORAS)
-        logger.info(
-            f"Recepcion tomo la conversacion {conversation_id_pausar}; "
-            f"Ana se pausa ahi por {PAUSA_HUMANO_HORAS}h"
+        ultimo_envio = _ultimo_envio_ana.get(conversation_id_pausar)
+        segundos_desde_envio = (
+            (datetime.now(timezone.utc) - ultimo_envio).total_seconds()
+            if ultimo_envio
+            else None
         )
+        if segundos_desde_envio is not None and segundos_desde_envio < MARGEN_ECO_SEGUNDOS:
+            logger.info(
+                f"Eco del propio mensaje de Ana en {conversation_id_pausar} "
+                f"({segundos_desde_envio:.1f}s despues de enviarlo); no se pausa"
+            )
+        else:
+            await pausar_conversacion(conversation_id_pausar, PAUSA_HUMANO_HORAS)
+            logger.info(
+                f"Recepcion tomo la conversacion {conversation_id_pausar}; "
+                f"Ana se pausa ahi por {PAUSA_HUMANO_HORAS}h"
+            )
         return {"status": "ok", "pausado": True}
 
     try:
@@ -221,6 +246,10 @@ async def procesar_mensaje(msg: MensajeEntrante):
             respuesta, es_respuesta_real = await generar_respuesta(msg.texto, historial)
 
             enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta, msg.contexto)
+
+            conversation_id = msg.contexto.get("conversation_id")
+            if enviado and conversation_id:
+                _ultimo_envio_ana[conversation_id] = datetime.now(timezone.utc)
 
             if not enviado:
                 # El evento se marco como procesado ANTES de llegar hasta aca, para que dos
