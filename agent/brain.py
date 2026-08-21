@@ -6,6 +6,7 @@ Logica de IA del agente. Lee el system prompt de config/prompts.yaml y genera la
 respuestas con la API de Anthropic.
 """
 
+import json
 import logging
 import os
 
@@ -13,10 +14,98 @@ import yaml
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
+from agent.cloudbeds import consultar_disponibilidad, generar_link_reserva
+
 load_dotenv()
 logger = logging.getLogger("agentkit")
 
 client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Herramientas que Ana puede llamar de verdad durante la conversacion. A diferencia de
+# agent/tools.py (que son funciones sueltas sin conectar), estas SI se pasan a la API
+# de Claude y SI se ejecutan cuando el modelo decide usarlas.
+TOOLS = [
+    {
+        "name": "consultar_disponibilidad_cloudbeds",
+        "description": (
+            "Consulta disponibilidad y tarifa real de habitaciones en Esencia Valladolid "
+            "Hotel para un rango de fechas, contra el PMS (Cloudbeds). Usala siempre que "
+            "el huesped pregunte por disponibilidad o precio de una habitacion con fechas "
+            "concretas, en vez de decir que no tenes esa informacion."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fecha_entrada": {
+                    "type": "string",
+                    "description": "Fecha de check-in, formato YYYY-MM-DD",
+                },
+                "fecha_salida": {
+                    "type": "string",
+                    "description": "Fecha de check-out, formato YYYY-MM-DD",
+                },
+                "adultos": {"type": "integer", "description": "Numero de adultos"},
+                "ninos": {"type": "integer", "description": "Numero de ninos (0 si no hay)"},
+            },
+            "required": ["fecha_entrada", "fecha_salida", "adultos"],
+        },
+    },
+    {
+        "name": "generar_link_reserva_cloudbeds",
+        "description": (
+            "Genera el link del motor de reservas de Cloudbeds con las fechas y huespedes "
+            "ya cargados, para que el huesped complete la reserva y el pago el mismo. "
+            "Usala despues de confirmar disponibilidad, cuando el huesped quiera reservar."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fecha_entrada": {
+                    "type": "string",
+                    "description": "Fecha de check-in, formato YYYY-MM-DD",
+                },
+                "fecha_salida": {
+                    "type": "string",
+                    "description": "Fecha de check-out, formato YYYY-MM-DD",
+                },
+                "adultos": {"type": "integer", "description": "Numero de adultos"},
+                "ninos": {"type": "integer", "description": "Numero de ninos (0 si no hay)"},
+            },
+            "required": ["fecha_entrada", "fecha_salida", "adultos"],
+        },
+    },
+]
+
+# Un mensaje con varias preguntas no deberia disparar una cadena larga de llamadas.
+# Esto es un techo de seguridad, no un comportamiento esperado.
+MAX_ITERACIONES_HERRAMIENTAS = 4
+
+
+async def _ejecutar_herramienta(nombre: str, entrada: dict) -> str:
+    """Corre la herramienta que Claude pidio y devuelve el resultado como JSON."""
+    try:
+        if nombre == "consultar_disponibilidad_cloudbeds":
+            resultado = await consultar_disponibilidad(
+                fecha_entrada=entrada.get("fecha_entrada", ""),
+                fecha_salida=entrada.get("fecha_salida", ""),
+                adultos=int(entrada.get("adultos") or 1),
+                ninos=int(entrada.get("ninos") or 0),
+            )
+            return json.dumps(resultado, ensure_ascii=False)
+
+        if nombre == "generar_link_reserva_cloudbeds":
+            link = generar_link_reserva(
+                fecha_entrada=entrada.get("fecha_entrada", ""),
+                fecha_salida=entrada.get("fecha_salida", ""),
+                adultos=int(entrada.get("adultos") or 1),
+                ninos=int(entrada.get("ninos") or 0),
+            )
+            return json.dumps({"link": link}, ensure_ascii=False)
+
+        return json.dumps({"error": f"Herramienta desconocida: {nombre}"}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001 — una herramienta rota no debe tirar la conversacion
+        logger.error(f"Error ejecutando la herramienta {nombre}: {e}")
+        return json.dumps({"error": "La herramienta fallo al ejecutarse"}, ensure_ascii=False)
 
 # El modelo se cambia desde .env, sin tocar el codigo.
 #   claude-opus-5     el mas capaz             $5 / $25 por millon de tokens
@@ -131,6 +220,7 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
             max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=mensajes,
+            tools=TOOLS,
             **parametros_extra,
         )
 
@@ -149,6 +239,29 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
                 return obtener_mensaje_error(), False
         else:
             logger.error(f"Error llamando a Claude: {e}")
+            return obtener_mensaje_error(), False
+
+    # Mientras Claude pida usar una herramienta, se la corremos y le devolvemos el
+    # resultado, hasta que decida que ya tiene lo necesario para contestarle al huesped.
+    iteraciones = 0
+    while respuesta.stop_reason == "tool_use" and iteraciones < MAX_ITERACIONES_HERRAMIENTAS:
+        iteraciones += 1
+        mensajes.append({"role": "assistant", "content": respuesta.content})
+
+        resultados = []
+        for bloque in respuesta.content:
+            if bloque.type != "tool_use":
+                continue
+            resultado = await _ejecutar_herramienta(bloque.name, bloque.input)
+            resultados.append(
+                {"type": "tool_result", "tool_use_id": bloque.id, "content": resultado}
+            )
+        mensajes.append({"role": "user", "content": resultados})
+
+        try:
+            respuesta = await _llamar(extras if _soporta_esfuerzo and ESFUERZO else {})
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error llamando a Claude durante el uso de herramientas: {e}")
             return obtener_mensaje_error(), False
 
     if getattr(respuesta, "stop_reason", None) == "max_tokens":
