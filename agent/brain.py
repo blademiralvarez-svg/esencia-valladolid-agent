@@ -9,6 +9,8 @@ respuestas con la API de Anthropic.
 import json
 import logging
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import yaml
 from anthropic import AsyncAnthropic
@@ -24,6 +26,13 @@ client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 # Herramientas que Ana puede llamar de verdad durante la conversacion. A diferencia de
 # agent/tools.py (que son funciones sueltas sin conectar), estas SI se pasan a la API
 # de Claude y SI se ejecutan cuando el modelo decide usarlas.
+
+# El modelo no tiene forma de saber que dia es "hoy": sin este dato, una fecha
+# relativa como "el 10 de septiembre" se presta a que adivine mal el anio (paso de
+# verdad: penso 2025 en vez de 2026 y la consulta a Cloudbeds salio con fechas ya
+# pasadas). Yucatan no tiene horario de verano, asi que la zona es fija todo el anio.
+ZONA_HORARIA_HOTEL = ZoneInfo("America/Merida")
+
 TOOLS = [
     {
         "name": "consultar_disponibilidad_cloudbeds",
@@ -139,11 +148,35 @@ def cargar_config_prompts() -> dict:
         return {}
 
 
+DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
 def cargar_system_prompt() -> str:
-    """El system prompt: quien es el agente y que sabe del negocio."""
-    return cargar_config_prompts().get(
+    """
+    El system prompt: quien es el agente, que sabe del negocio, y que fecha es hoy.
+
+    La fecha se calcula en cada llamada (no se guarda en prompts.yaml) para que
+    nunca quede vieja, y es lo que le permite al modelo resolver fechas relativas
+    ("el proximo fin de semana", "el 10 de septiembre") sin adivinar el anio.
+    """
+    base = cargar_config_prompts().get(
         "system_prompt", "Eres un asistente util. Responde siempre en espanol."
     )
+    ahora = datetime.now(ZONA_HORARIA_HOTEL)
+    fecha_legible = f"{DIAS_ES[ahora.weekday()]} {ahora.day} de {MESES_ES[ahora.month - 1]} de {ahora.year}"
+    contexto_fecha = (
+        f"\n\n## Fecha y hora actual\n"
+        f"Hoy es {fecha_legible}, {ahora.strftime('%H:%M')} hora de Valladolid, Yucatan "
+        f"(UTC-6). Usa esta fecha como referencia real para calcular cualquier fecha "
+        f"relativa que mencione el huesped (\"manana\", \"el proximo fin de semana\", "
+        f"\"el 10 de septiembre\") antes de llamar a cualquier herramienta. Las fechas "
+        f"que le pases a las herramientas van en formato YYYY-MM-DD."
+    )
+    return base + contexto_fecha
 
 
 def obtener_mensaje_error() -> str:
